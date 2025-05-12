@@ -19,17 +19,21 @@ try {
     console.log("Available env vars:", Object.keys(process.env).filter(key => 
         key.startsWith("MONGO_") || 
         key.startsWith("GOOGLE_") || 
-        key.startsWith("SESSION_")
+        key.startsWith("SESSION_") ||
+        key === "NODE_ENV" ||
+        key === "FRONTEND_URL"
     ));
 } catch (err) {
     console.error("Error loading .env file:", err);
 }
 
 const app = express();
+const isProduction = process.env.NODE_ENV === 'production';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 // ===== Middleware with error handling =====
 app.use(cors({
-    origin: "http://localhost:3000",
+    origin: FRONTEND_URL,
     credentials: true
 }));
 app.use(express.json());
@@ -37,12 +41,21 @@ app.use(express.json());
 // Check if SESSION_SECRET is defined
 if (!process.env.SESSION_SECRET) {
     console.warn("⚠️ SESSION_SECRET not defined in environment, using fallback");
+    if (isProduction) {
+        console.error("CRITICAL: Running in production without SESSION_SECRET is insecure!");
+    }
 }
 
+// Configure session with more secure settings for production
 app.use(session({
     secret: process.env.SESSION_SECRET || "fallback-secret-key-for-development",
     resave: false,
-    saveUninitialized: true
+    saveUninitialized: false,
+    cookie: {
+        secure: isProduction, // Use secure cookies in production
+        httpOnly: true, // Prevent client-side JS from reading cookies
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
 }));
 
 app.use(passport.initialize());
@@ -52,6 +65,9 @@ app.use(passport.session());
 const mongoUri = process.env.MONGO_URI;
 if (!mongoUri) {
     console.error("❌ MONGO_URI not defined in environment variables");
+    if (isProduction) {
+        console.error("CRITICAL: Cannot connect to MongoDB without MONGO_URI in production!");
+    }
 }
 
 console.log("Attempting MongoDB connection...");
@@ -183,13 +199,17 @@ if (!googleClientId || !googleClientSecret || !googleCallbackUrl) {
         clientSecret: googleClientSecret ? "defined" : "missing",
         callbackUrl: googleCallbackUrl ? "defined" : "missing"
     });
+    
+    if (isProduction) {
+        console.error("CRITICAL: Google OAuth will not work without complete credentials!");
+    }
 }
 
 try {
     passport.use("google-default", new GoogleStrategy({
         clientID: googleClientId || "dummy-id",
         clientSecret: googleClientSecret || "dummy-secret",
-        callbackURL: googleCallbackUrl || "http://localhost:5000/auth/google/callback"
+        callbackURL: googleCallbackUrl || `http://localhost:5000/auth/google/callback`
     }, (accessToken, refreshToken, profile, done) => {
         return done(null, profile);
     }));
@@ -208,7 +228,7 @@ app.get("/auth/google",
 app.get("/auth/google/callback",
     passport.authenticate("google-default", { failureRedirect: "/" }),
     (req, res) => {
-        res.redirect("http://localhost:3000/selection");
+        res.redirect(`${FRONTEND_URL}/selection`);
     });
 
 // ===== Import Routes =====
@@ -229,6 +249,17 @@ try {
     
     router.get("/", (req, res) => {
         res.json({ msg: "Blast routes working" });
+    });
+    
+    // Get all blast entries
+    router.get("/all", async (req, res) => {
+        try {
+            const entries = await BlastEntry.find().sort({ createdAt: -1 });
+            res.json(entries);
+        } catch (err) {
+            console.error("❌ Error fetching blast data:", err);
+            res.status(500).json({ msg: "Error fetching blast data" });
+        }
     });
     
     router.post("/add", async (req, res) => {
@@ -350,7 +381,35 @@ app.use("/api/blasts", (req, res, next) => {
     next();
 }, blastRoutes);
 
+// Serve static assets in production
+if (isProduction) {
+    // Serve static files from the frontend build directory
+    const staticPath = path.join(__dirname, '../client/build');
+    if (fs.existsSync(staticPath)) {
+        console.log(`Serving static files from: ${staticPath}`);
+        app.use(express.static(staticPath));
+        
+        // Serve the index.html file for all routes not handled by the API
+        app.get('*', (req, res) => {
+            if (!req.path.startsWith('/api') && !req.path.startsWith('/auth')) {
+                res.sendFile(path.resolve(staticPath, 'index.html'));
+            }
+        });
+    } else {
+        console.warn(`Static path ${staticPath} does not exist. Not serving static files.`);
+    }
+}
+
 // ===== Health Check =====
+app.get("/api/health", (req, res) => {
+    res.json({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
+
+// Legacy root route
 app.get("/", (req, res) => {
     res.send("Server is running ✅");
 });
@@ -361,16 +420,19 @@ app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({ 
         msg: "Internal server error", 
-        error: process.env.NODE_ENV === 'production' ? 'Server error' : err.message 
+        error: isProduction ? 'Server error' : err.message 
     });
 });
 
 // ===== Start Server =====
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`Environment: ${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    console.log(`Frontend URL: ${FRONTEND_URL}`);
     console.log("Routes configured:");
     console.log("- GET /");
+    console.log("- GET /api/health");
     console.log("- GET /auth/google");
     console.log("- GET /auth/google/callback");
     console.log("- POST /api/dataentry/register");
